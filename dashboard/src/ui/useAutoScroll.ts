@@ -62,7 +62,22 @@ export function useAutoScroll(
       });
     };
 
-    el.addEventListener("wheel", onUserGesture, { passive: true });
+    // 处理 wheel 事件，向下滚动时保持 pinned 状态（issue #2159）
+    const onWheel = (e: WheelEvent) => {
+      // deltaY > 0 表示向下滚动，此时保持 pinned 状态
+      if (e.deltaY > 0) {
+        // 向下滚动时，确保 pinned 为 true 以便自动跟随
+        if (!isPinnedRef.current) {
+          isPinnedRef.current = true;
+          setShowJumpButton(false);
+        }
+        return;
+      }
+      // deltaY < 0 表示向上滚动，取消 pinned 状态
+      onUserGesture();
+    };
+
+    el.addEventListener("wheel", onWheel, { passive: true });
     el.addEventListener("touchmove", onUserGesture, { passive: true });
     el.addEventListener("keydown", onUserGesture);
     // pointerdown on the scrollbar gutter starts a drag-scroll. The
@@ -72,7 +87,7 @@ export function useAutoScroll(
 
     return () => {
       if (pendingFrame) cancelAnimationFrame(pendingFrame);
-      el.removeEventListener("wheel", onUserGesture);
+      el.removeEventListener("wheel", onWheel);
       el.removeEventListener("touchmove", onUserGesture);
       el.removeEventListener("keydown", onUserGesture);
       el.removeEventListener("pointerdown", onUserGesture);
