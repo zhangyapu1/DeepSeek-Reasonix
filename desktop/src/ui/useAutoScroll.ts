@@ -68,6 +68,21 @@ export function useAutoScroll(
       });
     };
 
+    // 处理 wheel 事件，向下滚动时保持 pinned 状态（issue #2159）
+    const onWheel = (e: WheelEvent) => {
+      // deltaY > 0 表示向下滚动，此时保持 pinned 状态
+      if (e.deltaY > 0) {
+        // 向下滚动时，确保 pinned 为 true 以便自动跟随
+        if (!isPinnedRef.current) {
+          isPinnedRef.current = true;
+          setShowJumpButton(false);
+        }
+        return;
+      }
+      // deltaY < 0 表示向上滚动，取消 pinned 状态
+      onUserGesture();
+    };
+
     // Scrollbar drag fires no wheel/touch; without scroll-watching here,
     // the ResizeObserver re-pins mid-drag and the thumb rubber-bands.
     let dragging = false;
@@ -88,7 +103,7 @@ export function useAutoScroll(
       onUserGesture();
     };
 
-    el.addEventListener("wheel", onUserGesture, { passive: true });
+    el.addEventListener("wheel", onWheel, { passive: true });
     el.addEventListener("touchmove", onUserGesture, { passive: true });
     el.addEventListener("keydown", onUserGesture);
     el.addEventListener("pointerdown", onPointerDown);
@@ -98,7 +113,7 @@ export function useAutoScroll(
 
     return () => {
       if (pendingFrame) cancelAnimationFrame(pendingFrame);
-      el.removeEventListener("wheel", onUserGesture);
+      el.removeEventListener("wheel", onWheel);
       el.removeEventListener("touchmove", onUserGesture);
       el.removeEventListener("keydown", onUserGesture);
       el.removeEventListener("pointerdown", onPointerDown);
