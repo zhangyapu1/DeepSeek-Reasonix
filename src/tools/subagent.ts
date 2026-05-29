@@ -218,6 +218,7 @@ export async function spawnSubagent(opts: SpawnSubagentOptions): Promise<Subagen
     hooks: [],
     stream: true,
     session: sessionName,
+    maxIterPerTurn: 25,
   });
 
   // Wire parent-abort → child-abort. Two pitfalls we have to handle:

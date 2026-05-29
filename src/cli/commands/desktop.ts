@@ -158,6 +158,11 @@ type InMessage = { tabId?: string } & (
   | { cmd: "plan_response"; id: number; response: PlanVerdict }
   | { cmd: "checkpoint_response"; id: number; response: CheckpointVerdict }
   | { cmd: "revision_response"; id: number; response: RevisionVerdict }
+  | {
+      cmd: "edit_response";
+      id: number;
+      response: { type: "apply" } | { type: "reject"; denyContext?: string } | { type: "apply-rest-of-turn" } | { type: "flip-to-auto" };
+    }
   | { cmd: "session_list" }
   | { cmd: "session_delete"; name: string }
   | { cmd: "session_load"; name: string }
@@ -470,6 +475,14 @@ interface PlanClearedEvent {
   type: "$plan_cleared";
 }
 
+interface EditRequiredEvent {
+  type: "$edit_required";
+  id: number;
+  toolName: string;
+  blocks: Array<{ path: string; search: string; replace: string }>;
+  preview: string;
+}
+
 type McpSpecStatus = "configured" | "handshake" | "connected" | "failed" | "disabled";
 type McpStatusHint = "auth" | "missing-token" | "command" | "network" | "unknown";
 
@@ -595,6 +608,7 @@ type EmittableEvent =
   | RevisionRequiredEvent
   | StepCompletedEvent
   | PlanClearedEvent
+  | EditRequiredEvent
   | SessionsEvent
   | SessionImportSourcesEvent
   | SessionImportResultEvent
@@ -1500,6 +1514,30 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
   // Frontend-reported focused tab — persisted so a restart reopens on it (#1244).
   let lastActiveTabId = "";
 
+  // Pending edit approvals — keyed by gate id. The tool interceptor resolves
+  // these when the frontend sends an edit_response command.
+  const pendingEditApprovals = new Map<
+    number,
+    {
+      resolve: (choice: { type: string; denyContext?: string }) => void;
+      tabId: string;
+    }
+  >();
+  let editGateIdCounter = 0;
+
+  // Per-tab turn edit policy — tracks whether the user approved "apply rest of turn"
+  // within the current turn. Reset at the start of each new turn.
+  const tabTurnEditPolicy = new Map<string, { current: "ask" | "apply-all" }>();
+
+  function getTurnEditPolicy(tabId: string): { current: "ask" | "apply-all" } {
+    let policy = tabTurnEditPolicy.get(tabId);
+    if (!policy) {
+      policy = { current: "ask" };
+      tabTurnEditPolicy.set(tabId, policy);
+    }
+    return policy;
+  }
+
   function activeRunningTab(): Tab | undefined {
     const id = tabContext.getStore();
     return id ? tabs.get(id) : undefined;
@@ -2099,6 +2137,82 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
       hasSemanticSearch: toolset.semantic.enabled,
       modelId: tab.currentModel,
     });
+
+    // Add edit-mode gate interceptor — in review mode, edit tools require
+    // user approval before executing. This mirrors the CLI TUI's behavior
+    // where edit_file/write_file/multi_edit are queued for review (#2107).
+    tab.toolset.tools.addToolInterceptor("desktop-edit-gate", async (name, args) => {
+      const editMode = loadEditMode();
+      if (editMode !== "review") return null;
+      if (
+        name !== "edit_file" &&
+        name !== "write_file" &&
+        name !== "multi_edit" &&
+        name !== "delete_range" &&
+        name !== "delete_symbol"
+      ) {
+        return null;
+      }
+      // If user already approved "apply rest of turn", skip the gate.
+      const turnEditPolicy = getTurnEditPolicy(tab.id);
+      if (turnEditPolicy.current === "apply-all") return null;
+
+      const { buildEditToolBlocksForReview } = await import("../../cli/ui/edit-tool-gate.js");
+      const blocks = await buildEditToolBlocksForReview(
+        name,
+        args as Record<string, unknown>,
+        tab.rootDir,
+      );
+      if (!blocks || blocks.length === 0) return null;
+
+      const preview = blocks
+        .map((b) => {
+          const searchPreview = b.search.length > 100 ? `${b.search.slice(0, 100)}…` : b.search;
+          const replacePreview = b.replace.length > 100 ? `${b.replace.slice(0, 100)}…` : b.replace;
+          return `--- ${b.path}\n+++ ${b.path}\n-${searchPreview}\n+${replacePreview}`;
+        })
+        .join("\n\n");
+
+      const gateId = ++editGateIdCounter;
+      emit(
+        {
+          type: "$edit_required",
+          id: gateId,
+          toolName: name,
+          blocks,
+          preview,
+        },
+        tab.id,
+      );
+
+      const choice = await new Promise<{ type: string; denyContext?: string }>((resolve) => {
+        pendingEditApprovals.set(gateId, { resolve, tabId: tab.id });
+      });
+
+      if (choice.type === "reject") {
+        const context = choice.denyContext ? ` because: ${choice.denyContext}` : "";
+        return `User rejected this edit to ${blocks.map((b) => b.path).join(", ")}${context}. Don't retry the same SEARCH/REPLACE; either try a different approach or ask the user what they want instead.`;
+      }
+      if (choice.type === "apply-rest-of-turn") {
+        getTurnEditPolicy(tab.id).current = "apply-all";
+      }
+      if (choice.type === "flip-to-auto") {
+        saveEditMode("auto");
+        emitSettings(tab);
+      }
+
+      // Apply the edits.
+      const { applyEditBlocks, snapshotBeforeEdits } = await import("../../code/edit-blocks.js");
+      const { formatEditResults } = await import("../../cli/ui/edit-history.js");
+      const { prepareAutoGitRollbackForEditBlocks } = await import(
+        "../../code/auto-git-rollback.js"
+      );
+      const guard = prepareAutoGitRollbackForEditBlocks(tab.rootDir, blocks, {});
+      if (guard) return guard;
+      snapshotBeforeEdits(blocks, tab.rootDir);
+      const results = applyEditBlocks(blocks, tab.rootDir);
+      return formatEditResults(results);
+    });
     if (loadApiKey()) {
       bridgeEndpointEnv();
       tab.runtime = buildRuntimeFor(tab);
@@ -2203,6 +2317,9 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     if (!tab.runtime) return;
     const rt = tab.runtime;
     tab.aborter = new AbortController();
+    // Reset turn edit policy for the new turn.
+    const policy = tabTurnEditPolicy.get(tab.id);
+    if (policy) policy.current = "ask";
     if (fromQQ) markQQTurnStarted(qqRuntime.routing, tab.id);
     let lastAssistantText = "";
     if (tab.currentSession) {
@@ -2362,6 +2479,13 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
   function abortTurn(tab: Tab, opts: LoopAbortOptions = {}): void {
     tab.aborter?.abort();
     tab.runtime?.loop.abort(opts);
+    // Cancel any pending edit approvals for this tab.
+    for (const [id, pending] of pendingEditApprovals) {
+      if (pending.tabId === tab.id) {
+        pendingEditApprovals.delete(id);
+        pending.resolve({ type: "reject", denyContext: "turn aborted" });
+      }
+    }
   }
 
   function tabSessionLabel(tab: Tab): string {
@@ -2814,6 +2938,14 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
     if (msg.cmd === "revision_response") {
       forgetGate(msg.id);
       pauseGate.resolve(msg.id, msg.response);
+      return;
+    }
+    if (msg.cmd === "edit_response") {
+      const pending = pendingEditApprovals.get(msg.id);
+      if (pending) {
+        pendingEditApprovals.delete(msg.id);
+        pending.resolve(msg.response);
+      }
       return;
     }
     if (msg.cmd === "setup_save_key") {
