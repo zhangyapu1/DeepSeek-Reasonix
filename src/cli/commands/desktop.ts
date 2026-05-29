@@ -161,7 +161,11 @@ type InMessage = { tabId?: string } & (
   | {
       cmd: "edit_response";
       id: number;
-      response: { type: "apply" } | { type: "reject"; denyContext?: string } | { type: "apply-rest-of-turn" } | { type: "flip-to-auto" };
+      response:
+        | { type: "apply" }
+        | { type: "reject"; denyContext?: string }
+        | { type: "apply-rest-of-turn" }
+        | { type: "flip-to-auto" };
     }
   | { cmd: "session_list" }
   | { cmd: "session_delete"; name: string }
